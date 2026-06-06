@@ -1,1 +1,3 @@
-# init
+# __all__ = ["a"]
+
+# from .a import *

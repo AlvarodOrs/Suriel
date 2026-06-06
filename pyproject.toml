@@ -1,1 +1,17 @@
-# 
+[project]
+name = "suriel"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "dotenv>=0.9.9",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.3",
+    "requests>=2.34.2",
+    "stable-baselines3>=2.8.0",
+    "ta-lib>=0.6.8",
+    "tensorboard>=2.20.0",
+    "tqdm>=4.68.1",
+    "yfinance>=1.4.1",
+]

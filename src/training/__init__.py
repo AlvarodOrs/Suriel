@@ -1,1 +1,3 @@
-# init
+__all__ = ["train"]
+
+from .train import *
