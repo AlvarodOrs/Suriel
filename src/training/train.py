@@ -1,207 +1,139 @@
 import os
 import numpy as np
-from winsound import Beep
 import matplotlib.pyplot as plt
+from winsound import Beep
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
 
-from src.features import indicators
-from src.test.env import ForexTradingEnv
-from src.utils.progressBar import TqdmCallback
+from ..features import indicators
+from ..utils.progressBar import TqdmCallback
+from ..env.factory import make_env
+from .evaluation import evaluate_model
 
-def evaluate_model(model: PPO, eval_env: DummyVecEnv, deterministic: bool = True):
-    obs = eval_env.reset()
-    equity_curve = []
+class TradingPipeline:
+    def __init__(self, file_path):
+        self.file_path = file_path
 
-    while True:
-        action, _ = model.predict(obs, deterministic=deterministic)
-        step_out = eval_env.step(action)
+    # ---------- DATA ----------
+    def load_data(self):
+        df, feature_cols = indicators.load_and_preprocess_data(self.file_path)
 
-        if len(step_out) == 4:
-            obs, rewards, dones, infos = step_out
-            done = bool(dones[0])
-        else:
-            obs, rewards, terminated, truncated, infos = step_out
-            done = bool(terminated[0] or truncated[0])
+        split_idx = int(len(df) * 0.8)
+        self.train_df = df.iloc[:split_idx]
+        self.test_df = df.iloc[split_idx:]
+        self.feature_cols = feature_cols
 
-        info = infos[0] if isinstance(infos, (list, tuple)) else infos
-        # use equity from info (state *before* DummyVecEnv reset)
-        eq = info.get("equity_usd", eval_env.get_attr("equity_usd")[0])
-        equity_curve.append(eq)
+    # ---------- ENVS ----------
+    def build_envs(self):
+        self.train_vec_env = DummyVecEnv([
+            lambda: make_env(self.train_df, self.feature_cols, "train")
+        ])
 
-        if done:
-            break
+        self.train_eval_env = DummyVecEnv([
+            lambda: make_env(self.train_df, self.feature_cols, "eval")
+        ])
 
-    final_equity = float(equity_curve[-1])
-    return equity_curve, final_equity
+        self.test_eval_env = DummyVecEnv([
+            lambda: make_env(self.test_df, self.feature_cols, "eval")
+        ])
 
-
-
-def main():
-    file_path = "./data/raw/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
-    df, feature_cols = indicators.load_and_preprocess_data(file_path)
-
-    # Time split 80/20
-    split_idx = int(len(df) * 0.8)
-    train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
-
-    print("Training bars:", len(train_df))
-    print("Testing bars :", len(test_df))
-
-    # ---- Env factories ----
-    SL_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    TP_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    WIN = 30
-
-    # Train env: random starts to reduce memorization
-    def make_train_env():
-        return ForexTradingEnv(
-            df=train_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.2,
-            random_start=True,
-            min_episode_steps=1000,
-            episode_max_steps=2000,
-            feature_columns=feature_cols,
-            hold_reward_weight=0.0,#0.05
-            open_penalty_pips=0.0,      # 0.5 half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+    # ---------- MODEL ----------
+    def build_model(self):
+        self.model = PPO(
+            "MlpPolicy",
+            self.train_vec_env,
+            verbose=1,
+            tensorboard_log="./logs/tensorboard/"
         )
 
-    # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
-    def make_train_eval_env():
-        return ForexTradingEnv(
-            df=train_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.2,
-            random_start=False,
-            episode_max_steps=None,
-            feature_columns=feature_cols,
-            hold_reward_weight=0.00,
-            open_penalty_pips=0.0,      # half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+    # ---------- CHECKPOINTS ----------
+    def build_checkpoints(self):
+        self.ckpt_dir = "./checkpoints"
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+
+        self.checkpoint_callback = CheckpointCallback(
+            save_freq=50_000,
+            save_path=self.ckpt_dir,
+            name_prefix="ppo_eurusd"
         )
 
-    # Test-eval env: deterministic
-    def make_test_eval_env():
-        return ForexTradingEnv(
-            df=test_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.2,
-            random_start=False,
-            episode_max_steps=None,
-            feature_columns=feature_cols,
-            hold_reward_weight=0.00,
-            open_penalty_pips=0.0,      # half a pip per open
-            time_penalty_pips=0.00,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
-        )
+    # ---------- TRAIN ----------
+    def train(self, total_timesteps=600_000):
+        callback = TqdmCallback(total_timesteps)
 
-    train_vec_env = DummyVecEnv([make_train_env])
-    train_eval_env = DummyVecEnv([make_train_eval_env])
-    test_eval_env = DummyVecEnv([make_test_eval_env])
-
-    # ---- Model ----
-    model = PPO(
-        policy="MlpPolicy",
-        env=train_vec_env,
-        verbose=1,
-        tensorboard_log="./logs/tensorboard/"
-    )
-
-    # ---- Checkpoints ----
-    ckpt_dir = "./checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
-
-    checkpoint_callback = CheckpointCallback(
-        save_freq=50_000,
-        save_path=ckpt_dir,
-        name_prefix="ppo_eurusd"
-    )
-
-    # ---- Train ----
-    total_timesteps = 600000
-    callback = TqdmCallback(total_timesteps)
-    try:
-        model.learn(
-            total_timesteps=total_timesteps,
-            callback=[checkpoint_callback, callback]
-        )
-    except Exception as e:
-        Beep(400, 200)
-        Beep(400, 200)
-        Beep(400, 200)
-        Beep(400, 200)
-    # model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
-
-    # ---- Select best model by OOS final equity ----
-    equity_curve_test_last, final_equity_test_last = evaluate_model(model, test_eval_env)
-    print(f"[OOS Eval] Last model final equity: {final_equity_test_last:.2f}")
-
-    best_equity = -np.inf
-    best_path = None
-
-    ckpts = sorted(
-        [f for f in os.listdir(ckpt_dir) if f.endswith(".zip") and f.startswith("ppo_eurusd")],
-        key=lambda x: os.path.getmtime(os.path.join(ckpt_dir, x))
-    )
-
-    for ck in ckpts:
-        ck_path = os.path.join(ckpt_dir, ck)
         try:
-            m = PPO.load(ck_path, env=test_eval_env)
-            _, final_eq = evaluate_model(m, test_eval_env)
-            print(f"[OOS Eval] {ck} -> final equity: {final_eq:.2f}")
-            if final_eq > best_equity:
-                best_equity = final_eq
-                best_path = ck_path
-        except Exception as e:
-            print(f"[Skip] Could not evaluate checkpoint {ck}: {e}")
+            self.model.learn(
+                total_timesteps=total_timesteps,
+                callback=[self.checkpoint_callback, callback]
+            )
+        except Exception:
+            Beep(400, 200)
+            Beep(400, 200)
+            Beep(400, 200)
+            Beep(400, 200)
+            raise
 
-    # Decide best model
-    if best_path is None or final_equity_test_last >= best_equity:
-        print("Using last model as best (by OOS final equity).")
-        best_model = model
-    else:
-        print(f"Using best checkpoint: {best_path} (OOS final equity: {best_equity:.2f})")
-        best_model = PPO.load(best_path, env=train_vec_env)
+    # ---------- EVAL ----------
+    def evaluate_checkpoints(self):
+        self.last_equity_curve, self.last_equity = evaluate_model(
+            self.model,
+            self.test_eval_env
+        )
 
-    best_model.save("models/model_eurusd_best")
-    print("Best model saved: model_eurusd_best")
+        print(f"[OOS Eval] Last model: {self.last_equity:.2f}")
 
-    # ---- Plot BOTH: in-sample vs out-of-sample ----
-    equity_curve_train, final_equity_train = evaluate_model(best_model, train_eval_env)
-    equity_curve_test, final_equity_test = evaluate_model(best_model, test_eval_env)
+        best_equity = -np.inf
+        best_path = None
 
-    print(f"[IS Eval]  Final equity (train): {final_equity_train:.2f}")
-    print(f"[OOS Eval] Final equity (test) : {final_equity_test:.2f}")
+        ckpts = sorted(
+            [f for f in os.listdir(self.ckpt_dir) if f.endswith(".zip")],
+            key=lambda x: os.path.getmtime(os.path.join(self.ckpt_dir, x))
+        )
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_train, label="Train (in-sample) equity")
-    plt.plot(equity_curve_test, label="Test (out-of-sample) equity")
-    plt.title("Equity Curves: In-sample vs Out-of-sample (Best Model)")
-    plt.xlabel("Steps")
-    plt.ylabel("Equity ($)")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+        for ck in ckpts:
+            path = os.path.join(self.ckpt_dir, ck)
+            m = PPO.load(path, env=self.test_eval_env)
 
+            _, eq = evaluate_model(m, self.test_eval_env)
+            print(f"[OOS Eval] {ck} -> {eq:.2f}")
 
-if __name__ == "__main__":
-    main()
+            if eq > best_equity:
+                best_equity = eq
+                best_path = path
+
+        self.best_equity = best_equity
+        self.best_path = best_path
+
+    # ---------- SELECTION ----------
+    def select_best_model(self):
+        if self.best_path is None or self.last_equity >= self.best_equity:
+            self.best_model = self.model
+        else:
+            self.best_model = PPO.load(self.best_path, env=self.train_vec_env)
+
+        os.makedirs("models", exist_ok=True)
+        self.best_model.save("models/model_eurusd_best")
+
+    # ---------- PLOT ----------
+    def plot(self):
+        train_curve, _ = evaluate_model(self.best_model, self.train_eval_env)
+        test_curve, _ = evaluate_model(self.best_model, self.test_eval_env)
+
+        plt.plot(train_curve, label="Train")
+        plt.plot(test_curve, label="Test")
+        plt.legend()
+        plt.show()
+
+    # ---------- RUN ----------
+    def run(self):
+        self.load_data()
+        self.build_envs()
+        self.build_model()
+        self.build_checkpoints()
+
+        self.train()
+        self.evaluate_checkpoints()
+        self.select_best_model()
+        self.plot()

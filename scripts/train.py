@@ -1,3 +1,6 @@
-import src.training
+from src.training import TradingPipeline
 
-src.training.train.main()
+pipeline = TradingPipeline(
+    "./data/raw/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
+)
+pipeline.run()

@@ -1,3 +1,4 @@
-__all__ = ["train"]
+__all__ = ["train", "evaluation"]
 
 from .train import *
+from .evaluation import *
